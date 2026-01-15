@@ -2157,6 +2157,18 @@ export class GDBDebugSession extends LoggingDebugSession {
             this.stopped = true;
             this.stoppedReason = reason;
             this.findPausedThread(info);
+
+            // Clean up continue-to-thread breakpoint if target thread was hit
+            if (this.continueToThreadBpNum !== null && this.continueToThreadTargetId !== null) {
+                if (this.stoppedThreadId === this.continueToThreadTargetId) {
+                    this.handleMsg('log', `Continue to Thread: Thread ${this.continueToThreadTargetId} is now active, removing temp breakpoint\n`);
+                    const bpToDelete = this.continueToThreadBpNum;
+                    this.continueToThreadBpNum = null;
+                    this.continueToThreadTargetId = null;
+                    this.miDebugger.sendCommand(`break-delete ${bpToDelete}`).then(() => {}, () => {});
+                }
+            }
+
             if ((reason === 'entry') && this.args.noDebug) {
                 // Do not notify the front-end if no-debug is active and it is the entry point. Or else, pass it on
             } else {
