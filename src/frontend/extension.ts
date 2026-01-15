@@ -76,6 +76,7 @@ export class CortexDebugExtension {
             vscode.commands.registerCommand('cortex-debug.examineMemoryLegacy', this.examineMemoryLegacy.bind(this)),
 
             vscode.commands.registerCommand('cortex-debug.resetDevice', this.resetDevice.bind(this)),
+            vscode.commands.registerCommand('cortex-debug.continueToThread', this.continueToThread.bind(this)),
             vscode.commands.registerCommand('cortex-debug.pvtEnableDebug', this.pvtCycleDebugMode.bind(this)),
 
             vscode.commands.registerCommand('cortex-debug.liveWatch.addExpr', this.addLiveWatchExpr.bind(this)),
@@ -145,6 +146,78 @@ export class CortexDebugExtension {
                 }
             }
             session.customRequest('reset-device', 'reset');
+        }
+    }
+
+    private async continueToThread() {
+        const session = CortexDebugExtension.getActiveCDSession();
+        if (!session) {
+            vscode.window.showWarningMessage('No active debug session');
+            return;
+        }
+
+        try {
+            // Get list of threads from the debug adapter
+            const threadsResponse = await session.customRequest('get-threads-for-continue');
+            const threads: Array<{id: number, name: string, state: string}> = threadsResponse.threads || [];
+
+            if (threads.length === 0) {
+                vscode.window.showWarningMessage('No threads available');
+                return;
+            }
+
+            // Filter out the currently running thread (can't "continue to" a thread that's already running)
+            const stoppedThreadId = threadsResponse.stoppedThreadId;
+            const selectableThreads = threads.filter((t) => t.id !== stoppedThreadId);
+
+            if (selectableThreads.length === 0) {
+                vscode.window.showInformationMessage('Only one thread is running - nothing to continue to');
+                return;
+            }
+
+            // Show quick pick for thread selection
+            const items = selectableThreads.map((t) => ({
+                label: `${t.name}`,
+                description: `Thread ${t.id} - ${t.state}`,
+                threadId: t.id
+            }));
+
+            const selected = await vscode.window.showQuickPick(items, {
+                placeHolder: 'Select thread to continue to',
+                title: 'Continue to Thread'
+            });
+
+            if (!selected) {
+                return; // User cancelled
+            }
+
+            // Show progress while waiting for thread
+            vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: `Waiting for thread "${selected.label}"...`,
+                cancellable: true
+            }, async (progress, token) => {
+                token.onCancellationRequested(() => {
+                    session.customRequest('cancel-continue-to-thread');
+                });
+
+                try {
+                    const result = await session.customRequest('continue-to-thread', {
+                        threadId: selected.threadId,
+                        threadName: selected.label
+                    });
+
+                    if (result.success) {
+                        vscode.window.showInformationMessage(`Now debugging thread "${selected.label}"`);
+                    } else {
+                        vscode.window.showWarningMessage(result.message || 'Failed to continue to thread');
+                    }
+                } catch (err) {
+                    vscode.window.showErrorMessage(`Error: ${err}`);
+                }
+            });
+        } catch (err) {
+            vscode.window.showErrorMessage(`Failed to get thread list: ${err}`);
         }
     }
 

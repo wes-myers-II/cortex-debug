@@ -475,6 +475,12 @@
                 "command": "cortex-debug.liveWatch.addExpr",
                 "title": "Add expression to Live Watch window",
                 "icon": "$(plus)"
+            },
+            {
+                "category": "Cortex-Debug",
+                "command": "cortex-debug.continueToThread",
+                "title": "Continue to Thread",
+                "icon": "$(debug-continue)"
             }
         ],
         "keybindings": [

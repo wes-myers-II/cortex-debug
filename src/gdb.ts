@@ -16,7 +16,7 @@ import { Variable, VariableObject, MIError, OurDataBreakpoint, OurInstructionBre
 import {
     TelemetryEvent, ConfigurationArguments, StoppedEvent, GDBServerController, SymbolFile,
     createPortName, GenericCustomEvent, quoteShellCmdLine, toStringDecHexOctBin, ADAPTER_DEBUG_MODE, defSymbolFile, CTIAction, getPathRelative,
-    SWOConfigureEvent, RTTCommonDecoderOpts
+    SWOConfigureEvent, RTTCommonDecoderOpts, ThreadState, ThreadInfo
 } from './common';
 import { GDBServer, getServerLogFilePath, ServerConsoleLog } from './backend/server';
 import { MINode } from './backend/mi_parse';
@@ -310,6 +310,10 @@ export class GDBDebugSession extends LoggingDebugSession {
     protected configDone: boolean;
 
     protected suppressRadixMsgs = false;
+
+    // Continue to Thread feature - tracks temporary conditional breakpoint
+    protected continueToThreadBpNum: number | null = null;
+    protected continueToThreadTargetId: number | null = null;
 
     protected tcpPortAllocatedListner = this.tcpPortsAllocated.bind(this);
 
@@ -1351,6 +1355,15 @@ export class GDBDebugSession extends LoggingDebugSession {
             case 'reset-device':
                 this.resetDevice(response, args);
                 break;
+            case 'get-threads-for-continue':
+                this.getThreadsForContinue(response);
+                break;
+            case 'continue-to-thread':
+                this.continueToThread(response, args);
+                break;
+            case 'cancel-continue-to-thread':
+                this.cancelContinueToThread(response);
+                break;
             case 'custom-stop-debugging':
                 this.serverConsoleLog(`Got request ${command}`);
                 await this.disconnectRequest2(response, args);
@@ -1998,6 +2011,78 @@ export class GDBDebugSession extends LoggingDebugSession {
         this.stoppedReason = 'user request';
         this.findPausedThread(info);
         this.notifyStoppedConditional();
+    }
+
+    /**
+     * Detect thread state based on thread ID and current function.
+     * - RUNNING: Thread is the current thread (executing on CPU)
+     * - BLOCKED: Thread is waiting in a blocking function
+     * - SUSPENDED: Thread is at a context switch point
+     * - UNKNOWN: State could not be determined
+     */
+    protected detectThreadState(threadId: number, currentThreadId: number, frameFunc: string): ThreadState {
+        // Current thread is RUNNING
+        if (threadId === currentThreadId) {
+            return ThreadState.RUNNING;
+        }
+
+        // Check function name for blocking indicators
+        const func = frameFunc.toLowerCase();
+
+        // Context switch points indicate suspended/blocked state
+        const contextSwitchFuncs = [
+            '_switch_restore_pc',
+            'arch_switch',
+            '_isr_wrapper',
+            'z_swap',
+            'swap'
+        ];
+        if (contextSwitchFuncs.some((f) => func.includes(f))) {
+            return ThreadState.SUSPENDED;
+        }
+
+        // Zephyr blocking functions
+        const blockingFuncs = [
+            'k_poll', 'k_sem_take', 'k_mutex_lock', 'k_msgq_get',
+            'k_queue_get', 'k_fifo_get', 'k_lifo_get',
+            'k_condvar_wait', 'k_event_wait', 'k_pipe_get',
+            'k_sleep', 'k_msleep', 'k_usleep',
+            'k_thread_join', 'k_work_poll_submit'
+        ];
+        if (blockingFuncs.some((f) => func.includes(f))) {
+            return ThreadState.BLOCKED;
+        }
+
+        // FreeRTOS blocking functions (for compatibility)
+        const freertosBlockingFuncs = [
+            'vTaskDelay', 'xQueueReceive', 'xSemaphoreTake',
+            'ulTaskNotifyTake', 'xEventGroupWaitBits'
+        ];
+        if (freertosBlockingFuncs.some((f) => func.includes(f))) {
+            return ThreadState.BLOCKED;
+        }
+
+        // If not current and not at known points, mark as suspended (switched out)
+        return ThreadState.SUSPENDED;
+    }
+
+    /**
+     * Get emoji indicator for thread state.
+     */
+    protected getThreadStateEmoji(state: ThreadState): string {
+        switch (state) {
+            case ThreadState.RUNNING:
+                return '▶';  // Running indicator
+            case ThreadState.BLOCKED:
+                return '⏸';  // Blocked/waiting indicator
+            case ThreadState.PENDING:
+                return '⏳';  // Ready to run indicator
+            case ThreadState.SUSPENDED:
+                return '○';  // Suspended indicator
+            case ThreadState.UNKNOWN:
+            default:
+                return '?';  // Unknown state
+        }
     }
 
     protected handleThreadCreated(info: { threadId: number; threadGroupId: string }) {
@@ -2715,12 +2800,20 @@ export class GDBDebugSession extends LoggingDebugSession {
                         const details = MINode.valueOf(th, 'details');
                         let name = MINode.valueOf(th, 'name');
 
+                        // Extract function name from frame for state detection
+                        const frameFunc = MINode.valueOf(th, 'frame.func') || '';
+
                         if (name && details && (name !== details)) {
                             // Try to emulate how gdb shows thread info. Nice for servers like pyocd.
                             name += ` (${details})`;
                         } else {
                             name = name || details || tid;
                         }
+
+                        // Detect thread state and add badge to name
+                        const state = this.detectThreadState(id, this.currentThreadId, frameFunc);
+                        const stateEmoji = this.getThreadStateEmoji(state);
+                        name = `${stateEmoji} ${name}`;
 
                         return new Thread(id, name);
                     } else {
@@ -3374,17 +3467,37 @@ export class GDBDebugSession extends LoggingDebugSession {
 
     protected async stepInRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): Promise<void> {
         try {
+            const runningThreadId = this.stoppedThreadId || args.threadId;
+
+            // If user clicked step on a different thread, do "continue to thread" instead
+            if (args.threadId && args.threadId !== runningThreadId) {
+                this.handleMsg('log', `Thread ${args.threadId} is not running. Continuing until it becomes active...\n`);
+                await this.doContinueToThread(args.threadId);
+                this.sendResponse(response);
+                return;
+            }
+
             const assemblyMode = args.granularity === 'instruction';
-            const done = await this.miDebugger.step(args.threadId, assemblyMode);
+            const done = await this.miDebugger.step(runningThreadId, assemblyMode);
             this.sendResponse(response);
         } catch (msg) {
-            this.sendErrorResponse(response, 6, `Could not step over: ${msg}`);
+            this.sendErrorResponse(response, 6, `Could not step: ${msg}`);
         }
     }
 
     protected async stepOutRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): Promise<void> {
         try {
-            const done = await this.miDebugger.stepOut(args.threadId);
+            const runningThreadId = this.stoppedThreadId || args.threadId;
+
+            // If user clicked step on a different thread, do "continue to thread" instead
+            if (args.threadId && args.threadId !== runningThreadId) {
+                this.handleMsg('log', `Thread ${args.threadId} is not running. Continuing until it becomes active...\n`);
+                await this.doContinueToThread(args.threadId);
+                this.sendResponse(response);
+                return;
+            }
+
+            const done = await this.miDebugger.stepOut(runningThreadId);
             this.sendResponse(response);
         } catch (msg) {
             this.sendErrorResponse(response, 5, `Could not step out: ${msg}`);
@@ -3393,12 +3506,67 @@ export class GDBDebugSession extends LoggingDebugSession {
 
     protected async nextRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): Promise<void> {
         try {
+            const runningThreadId = this.stoppedThreadId || args.threadId;
+
+            // If user clicked step on a different thread, do "continue to thread" instead
+            if (args.threadId && args.threadId !== runningThreadId) {
+                this.handleMsg('log', `Thread ${args.threadId} is not running. Continuing until it becomes active...\n`);
+                await this.doContinueToThread(args.threadId);
+                this.sendResponse(response);
+                return;
+            }
             const assemblyMode = args.granularity === 'instruction';
-            const done = await this.miDebugger.next(args.threadId, assemblyMode);
+            const done = await this.miDebugger.next(runningThreadId, assemblyMode);
             this.sendResponse(response);
         } catch (msg) {
             this.sendErrorResponse(response, 6, `Could not step over: ${msg}`);
         }
+    }
+
+    // Helper for "continue to thread" - sets conditional BP and continues
+    protected async doContinueToThread(targetThreadId: number): Promise<void> {
+        // Get the thread's current frame to find where to set the breakpoint
+        const threadInfo = await this.miDebugger.sendCommand(`thread-info ${targetThreadId}`);
+        const threads = threadInfo.result('threads') || [];
+        if (threads.length === 0) {
+            throw new Error('Thread not found');
+        }
+
+        const thread = threads[0];
+        const frameAddr = MINode.valueOf(thread, 'frame.addr');
+        const frameFunc = MINode.valueOf(thread, 'frame.func') || '';
+
+        if (!frameAddr) {
+            throw new Error('Could not determine thread location');
+        }
+
+        // Remove any existing continue-to-thread breakpoint
+        if (this.continueToThreadBpNum !== null) {
+            try {
+                await this.miDebugger.sendCommand(`break-delete ${this.continueToThreadBpNum}`);
+            } catch (e) {
+                // Ignore
+            }
+        }
+
+        // Set conditional breakpoint for this thread
+        const bpCmd = `break-insert -c "$_thread == ${targetThreadId}" *${frameAddr}`;
+        this.handleMsg('log', `Setting conditional BP for thread ${targetThreadId}: ${bpCmd}\n`);
+
+        const bpResult = await this.miDebugger.sendCommand(bpCmd);
+        const bpNum = parseInt(MINode.valueOf(bpResult.result('bkpt'), 'number'));
+
+        if (isNaN(bpNum)) {
+            throw new Error('Failed to set conditional breakpoint');
+        }
+
+        this.continueToThreadBpNum = bpNum;
+        this.continueToThreadTargetId = targetThreadId;
+
+        this.handleMsg('log', `Continuing until thread ${targetThreadId} (${frameFunc || frameAddr}) becomes active...\n`);
+
+        // Continue execution
+        await this.miDebugger.sendCommand('exec-continue');
     }
 
     protected checkFileExists(name: string): boolean {
@@ -3606,6 +3774,134 @@ export class GDBDebugSession extends LoggingDebugSession {
             }
         } catch (msg) {
             this.sendErrorResponse(response, 16, `Could not jump to: ${msg ? msg : ''} ${args.source.path}:${args.line}`);
+        }
+    }
+
+    //==========================================================================
+    // Continue to Thread feature
+    //==========================================================================
+
+    protected async getThreadsForContinue(response: DebugProtocol.Response): Promise<void> {
+        try {
+            // Get thread info from GDB
+            const threadIdResults = await this.miDebugger.sendCommand('thread-info');
+            const rawThreads = threadIdResults.result('threads') || [];
+
+            const threads: Array<{id: number, name: string, state: string}> = [];
+            for (const thread of rawThreads) {
+                const id = parseInt(MINode.valueOf(thread, 'id'));
+                const targetId = MINode.valueOf(thread, 'target-id') || '';
+                const name = MINode.valueOf(thread, 'name') || targetId || `Thread ${id}`;
+                const frameFunc = MINode.valueOf(thread, 'frame.func') || '';
+
+                // Determine thread state
+                const state = this.detectThreadState(id, this.stoppedThreadId, frameFunc);
+
+                threads.push({ id, name, state });
+            }
+
+            response.body = {
+                threads,
+                stoppedThreadId: this.stoppedThreadId
+            };
+            this.sendResponse(response);
+        } catch (err) {
+            this.sendErrorResponse(response, 111, `Failed to get threads: ${err}`);
+        }
+    }
+
+    protected async continueToThread(response: DebugProtocol.Response, args: any): Promise<void> {
+        const targetThreadId = args.threadId;
+        const threadName = args.threadName || `Thread ${targetThreadId}`;
+
+        try {
+            // Get the thread's current frame to find where to set the breakpoint
+            const threadInfo = await this.miDebugger.sendCommand(`thread-info ${targetThreadId}`);
+            const threads = threadInfo.result('threads') || [];
+            if (threads.length === 0) {
+                response.body = { success: false, message: 'Thread not found' };
+                this.sendResponse(response);
+                return;
+            }
+
+            const thread = threads[0];
+            const frameAddr = MINode.valueOf(thread, 'frame.addr');
+            const frameFunc = MINode.valueOf(thread, 'frame.func') || '';
+            const frameLine = MINode.valueOf(thread, 'frame.line') || '';
+            const frameFile = MINode.valueOf(thread, 'frame.file') || '';
+
+            if (!frameAddr) {
+                response.body = { success: false, message: 'Could not determine thread location' };
+                this.sendResponse(response);
+                return;
+            }
+
+            // Remove any existing continue-to-thread breakpoint
+            if (this.continueToThreadBpNum !== null) {
+                try {
+                    await this.miDebugger.sendCommand(`break-delete ${this.continueToThreadBpNum}`);
+                } catch (e) {
+                    // Ignore errors removing old breakpoint
+                }
+            }
+
+            // Set conditional breakpoint that only triggers for the target thread
+            // Using $_thread GDB convenience variable
+            const bpCmd = `break-insert -c "$_thread == ${targetThreadId}" *${frameAddr}`;
+            this.handleMsg('log', `Continue to Thread: Setting conditional BP: ${bpCmd}\n`);
+
+            const bpResult = await this.miDebugger.sendCommand(bpCmd);
+            const bpNum = parseInt(MINode.valueOf(bpResult.result('bkpt'), 'number'));
+
+            if (isNaN(bpNum)) {
+                response.body = { success: false, message: 'Failed to set conditional breakpoint' };
+                this.sendResponse(response);
+                return;
+            }
+
+            this.continueToThreadBpNum = bpNum;
+            this.continueToThreadTargetId = targetThreadId;
+
+            this.handleMsg('log', `Continue to Thread: Breakpoint ${bpNum} set for thread ${targetThreadId} at ${frameAddr}\n`);
+            this.handleMsg('log', `Continue to Thread: Location: ${frameFunc} ${frameFile}:${frameLine}\n`);
+
+            // Continue execution
+            await this.miDebugger.sendCommand('exec-continue');
+
+            // Note: The response will be sent when we hit the breakpoint or user cancels
+            // For now, send success to indicate the operation started
+            response.body = { success: true, message: `Waiting for thread "${threadName}" at ${frameFunc || frameAddr}` };
+            this.sendResponse(response);
+
+        } catch (err) {
+            this.handleMsg('log', `Continue to Thread: Error: ${err}\n`);
+            response.body = { success: false, message: `Error: ${err}` };
+            this.sendResponse(response);
+        }
+    }
+
+    protected async cancelContinueToThread(response: DebugProtocol.Response): Promise<void> {
+        try {
+            // First, halt the target
+            await this.miDebugger.sendCommand('exec-interrupt');
+
+            // Remove the temporary breakpoint
+            if (this.continueToThreadBpNum !== null) {
+                try {
+                    await this.miDebugger.sendCommand(`break-delete ${this.continueToThreadBpNum}`);
+                    this.handleMsg('log', `Continue to Thread: Cancelled, removed breakpoint ${this.continueToThreadBpNum}\n`);
+                } catch (e) {
+                    // Ignore errors
+                }
+                this.continueToThreadBpNum = null;
+                this.continueToThreadTargetId = null;
+            }
+
+            response.body = { success: true };
+            this.sendResponse(response);
+        } catch (err) {
+            response.body = { success: false, message: `Error: ${err}` };
+            this.sendResponse(response);
         }
     }
 }

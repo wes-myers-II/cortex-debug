@@ -34,6 +34,34 @@ export enum NumberFormat {
     Binary
 }
 
+/**
+ * Thread execution state for RTOS-aware debugging.
+ * - RUNNING: Thread is currently executing on the CPU
+ * - BLOCKED: Thread is waiting (semaphore, mutex, poll, sleep, etc.)
+ * - PENDING: Thread is ready to run but not scheduled
+ * - SUSPENDED: Thread is explicitly suspended
+ * - UNKNOWN: Thread state could not be determined
+ */
+export enum ThreadState {
+    RUNNING = 'RUNNING',
+    BLOCKED = 'BLOCKED',
+    PENDING = 'PENDING',
+    SUSPENDED = 'SUSPENDED',
+    UNKNOWN = 'UNKNOWN'
+}
+
+/**
+ * Extended thread info that includes RTOS state.
+ */
+export interface ThreadInfo {
+    id: number;
+    name: string;
+    state: ThreadState;
+    priority?: number;
+    currentFunction?: string;
+    details?: string;
+}
+
 export interface NodeSetting {
     node: string;
     expanded?: boolean;
